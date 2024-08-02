@@ -1,0 +1,16 @@
+{
+  "name": "aiprox",
+  "module": "index.ts",
+  "type": "module",
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5.0.0"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.25.0",
+    "bunorm": "^0.0.1",
+    "ulid": "^2.3.0"
+  }
+}
