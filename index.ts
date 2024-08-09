@@ -1,7 +1,10 @@
 import { serve } from 'bun';
+import { AuthManager } from './auth';
+import { RateLimiter } from './rateLimit';
+import { getUserIdByEmail, addRequest, updateRequestWithUsageData } from './db';
 
 const PROXY_DOMAIN = 'api.anthropic.com';
-const SERVER_SIDE_API_KEY = process.env.ANTHROPIC_KEY || ''; // Replace with your actual API key
+const SERVER_SIDE_API_KEY = process.env.ANTHROPIC_KEY || '';
 
 const server = serve({
   port: 3004,
@@ -10,47 +13,66 @@ const server = serve({
 
     console.log(`Incoming request: ${req.method} ${url}`);
 
+    const authManager = new AuthManager();
+    const rateLimiter = new RateLimiter();
+
     // Authentication endpoints
     if (url.pathname === '/auth/send-code' && req.method === 'POST') {
-      // const { email } = await req.json();
-      // const sent = await authManager.sendLoginCode(email);
-      // return new Response(JSON.stringify({ success: sent }), {
-      //   headers: { 'Content-Type': 'application/json' }
-      // });
+      const { email } = await req.json();
+      const sent = await authManager.sendLoginCode(email);
+      return new Response(JSON.stringify({ success: sent }), {
+        headers: { 'Content-Type': 'application/json' },
+      });
     }
 
     if (url.pathname === '/auth/verify-code' && req.method === 'POST') {
-      // const { email, code } = await req.json();
-      // const verified = authManager.verifyLoginCode(email, code);
-      // if (verified) {
-      //   const token = authManager.issueToken(email);
-      //   return new Response(JSON.stringify({ token }), {
-      //     headers: { 'Content-Type': 'application/json' }
-      //   });
-      // }
-      // return new Response(JSON.stringify({ error: 'Invalid code' }), {
-      //   status: 400,
-      //   headers: { 'Content-Type': 'application/json' }
-      // });
+      const { email, code } = await req.json();
+      const verified = authManager.verifyLoginCode(email, code);
+      if (verified) {
+        const token = authManager.issueToken(email);
+        return new Response(JSON.stringify({ token }), {
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      return new Response(JSON.stringify({ error: 'Invalid code' }), {
+        status: 400,
+        headers: { 'Content-Type': 'application/json' },
+      });
     }
 
     // For all other requests, verify the token and apply rate limiting
-    // const authHeader = req.headers.get('Authorization');
-    // if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    //   return new Response('Unauthorized', { status: 401 });
-    // }
+    const authHeader = req.headers.get('Authorization');
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return new Response('Unauthorized', { status: 401 });
+    }
 
-    // const token = authHeader.split(" ")[1];
-    // const userId = authManager.verifyToken(token);
-    // if (!userId) {
-    //   return new Response("Unauthorized", { status: 401 });
-    // }
+    const token = authHeader.split(' ')[1];
+    const userEmail = authManager.verifyToken(token);
+    if (!userEmail) {
+      return new Response('Unauthorized', { status: 401 });
+    }
 
-    // // Check rate limit
-    // const allowed = await rateLimiter.checkAndIncrementRequests(userId);
-    // if (!allowed) {
-    //   return new Response("Rate limit exceeded", { status: 429 });
-    // }
+    const userId = getUserIdByEmail(userEmail);
+    if (!userId) {
+      return new Response('User not found', { status: 404 });
+    }
+
+    // Prepare request data for rate limiting
+    const requestData = {
+      method: req.method,
+      path: url.pathname,
+      timestamp: Date.now(),
+    };
+
+    // Check rate limit
+    const allowed = rateLimiter.checkAndIncrement(userEmail, requestData);
+
+    if (!allowed) {
+      return new Response('Rate limit exceeded', { status: 429 });
+    }
+
+    // Add the request to the database and get the requestId
+    const requestId = addRequest(userEmail, requestData);
 
     // Swap the domain for the proxied domain
     url.hostname = PROXY_DOMAIN;
@@ -70,11 +92,7 @@ const server = serve({
     proxyReq.headers.set('x-api-key', SERVER_SIDE_API_KEY);
 
     proxyReq.headers.delete('Authorization');
-
     proxyReq.headers.delete('Host');
-
-    // // Ensure Accept header is set for SSE
-    // proxyReq.headers.set('Accept', 'text/event-stream');
 
     // Forward the request and get the response
     const proxyRes = await fetch(proxyReq);
@@ -118,6 +136,7 @@ const server = serve({
 
                 if (type === 'message_stop') {
                   console.log('Usage data:', usageData);
+                  updateRequestWithUsageData(requestId, usageData);
                 }
               } catch (e) {
                 // console.log('Error parsing JSON:', e);
@@ -135,6 +154,8 @@ const server = serve({
       console.log(`Response status: ${proxyRes.status}`);
       const json = await proxyRes.json();
       console.log(json);
+      // Update usage data for non-SSE responses
+      updateRequestWithUsageData(requestId, usageData);
       return proxyRes;
     }
   },

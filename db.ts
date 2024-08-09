@@ -1,76 +1,123 @@
-import { BunORM } from 'bunorm';
+import { Database } from 'bun:sqlite';
+import { ulid } from 'ulid';
 
-const db = new BunORM('db.sql3', {
-  tables: {
-    users: {
-      columns: {
-        email: {
-          type: 'TEXT',
-          unique: true,
-        },
-        subscription: {
-          type: 'JSON',
-          default: false,
-        },
-      },
-    },
-    tokens: {
-      columns: {
-        token: {
-          type: 'TEXT',
-          unique: true,
-        },
-        device: {
-          type: 'TEXT',
-        },
-        location: {
-          type: 'TEXT',
-        },
-        lastUsed: {
-          type: 'JSON',
-          default: {} as Date,
-        },
-      },
-    },
-    loginCodes: {
-      columns: {
-        code: {
-          type: 'TEXT',
-        },
-        email: {
-          type: 'TEXT',
-          unique: true,
-        },
-      },
-    },
-    requests: {
-      columns: {
-        email: {
-          type: 'TEXT',
-        },
-        status: {
-          type: 'TEXT',
-        },
-      },
-    },
-  },
-});
+let db: Database;
 
-function generateLoginCode(email: string) {
-  const code = Math.random().toString(36).substring(2, 8);
-  db.tables.loginCodes.delete({ email });
-  db.tables.loginCodes.create({ code, email });
+export function initializeDatabase(dbName: string = 'aiprox.sqlite') {
+  db = new Database(dbName);
+
+  // Initialize the database
+  db.run(`
+    CREATE TABLE IF NOT EXISTS users (
+      id TEXT PRIMARY KEY,
+      email TEXT UNIQUE,
+      login_code TEXT,
+      login_code_expires_at INTEGER
+    )
+  `);
+
+  db.run(`
+    CREATE TABLE IF NOT EXISTS requests (
+      id TEXT PRIMARY KEY,
+      user_id TEXT,
+      timestamp INTEGER,
+      request_data TEXT,
+      usage_data TEXT
+    )
+  `);
 }
 
-function validateLoginCode(email: string, code: string) {
-  const loginCode = db.tables.loginCodes.findBy({ email })[0];
-  const createdAt = new Date(loginCode.createdAt);
-  const now = new Date();
-  const diffInSeconds = Math.abs(now.getTime() - createdAt.getTime()) / 1000;
-  const diffInMinutes = Math.floor(diffInSeconds / 60);
-  if (loginCode.code === code && diffInMinutes < 5) {
-    db.tables.loginCodes.delete({ email });
-    return true;
+export function generateLoginCode(email: string): string {
+  const code = Math.floor(100000 + Math.random() * 900000).toString();
+  const expiresAt = Date.now() + 15 * 60 * 1000; // 15 minutes from now
+
+  const userId = ulid();
+  db.run('INSERT OR IGNORE INTO users (id, email) VALUES (?, ?)', [
+    userId,
+    email,
+  ]);
+  db.run(
+    'UPDATE users SET login_code = ?, login_code_expires_at = ? WHERE email = ?',
+    [code, expiresAt, email]
+  );
+
+  return code;
+}
+
+export function validateLoginCode(email: string, code: string): boolean {
+  const result = db
+    .query(
+      'SELECT login_code, login_code_expires_at FROM users WHERE email = ?'
+    )
+    .get(email) as { login_code: string; login_code_expires_at: number } | null;
+
+  if (!result) return false;
+
+  const { login_code, login_code_expires_at } = result;
+  const isValid = login_code === code && login_code_expires_at > Date.now();
+
+  if (isValid) {
+    // Clear the login code after successful validation
+    db.run(
+      'UPDATE users SET login_code = NULL, login_code_expires_at = NULL WHERE email = ?',
+      [email]
+    );
   }
-  return false;
+
+  return isValid;
 }
+
+export function addRequest(email: string, requestData: object): string {
+  const user = db.query('SELECT id FROM users WHERE email = ?').get(email) as {
+    id: string;
+  } | null;
+  if (!user) return '';
+
+  const requestId = ulid();
+  db.run(
+    'INSERT INTO requests (id, user_id, timestamp, request_data) VALUES (?, ?, ?, ?)',
+    [requestId, user.id, Date.now(), JSON.stringify(requestData)]
+  );
+
+  return requestId;
+}
+
+export function updateRequestWithUsageData(
+  requestId: string,
+  usageData: object
+): void {
+  db.run('UPDATE requests SET usage_data = ? WHERE id = ?', [
+    JSON.stringify(usageData),
+    requestId,
+  ]);
+}
+
+export function getRequestCount(email: string, timeWindowMs: number): number {
+  const user = db.query('SELECT id FROM users WHERE email = ?').get(email) as {
+    id: string;
+  } | null;
+  if (!user) return 0;
+
+  const result = db
+    .query(
+      'SELECT COUNT(*) as count FROM requests WHERE user_id = ? AND timestamp > ?'
+    )
+    .get(user.id, Date.now() - timeWindowMs) as { count: number };
+  return result.count;
+}
+
+export function clearOldRequests(timeWindowMs: number): void {
+  db.run('DELETE FROM requests WHERE timestamp <= ?', [
+    Date.now() - timeWindowMs,
+  ]);
+}
+
+export function getUserIdByEmail(email: string): string | null {
+  const result = db
+    .query('SELECT id FROM users WHERE email = ?')
+    .get(email) as { id: string } | null;
+  return result ? result.id : null;
+}
+
+// Initialize the database with the default name
+initializeDatabase();
